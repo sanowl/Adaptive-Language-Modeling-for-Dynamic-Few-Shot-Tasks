@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader
-from transformers import GPT2LMHeadModel, AutoTokenizer, AdamW
+from transformers import AutoModelForCausalLM, AutoTokenizer, AdamW
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 from typing import List, Dict, Optional
@@ -51,9 +51,10 @@ class DynamicPromptTuning(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.gpt2 = GPT2LMHeadModel.from_pretrained(config.model_name)
-        self.prompt_embedding = nn.Parameter(torch.randn(config.num_tokens, self.gpt2.config.n_embd) / math.sqrt(self.gpt2.config.n_embd))
-        self.task_layer = nn.Linear(self.gpt2.config.n_embd, self.gpt2.config.n_embd)
+        self.gpt = AutoModelForCausalLM.from_pretrained(config.model_name)
+        hidden_size = self.gpt.config.hidden_size
+        self.prompt_embedding = nn.Parameter(torch.randn(config.num_tokens, hidden_size) / math.sqrt(hidden_size))
+        self.task_layer = nn.Linear(hidden_size, hidden_size)
         nn.init.xavier_uniform_(self.task_layer.weight)
         nn.init.zeros_(self.task_layer.bias)
 
@@ -61,21 +62,16 @@ class DynamicPromptTuning(nn.Module):
                 labels: Optional[torch.Tensor] = None, task_embedding: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         batch_size = input_ids.shape[0]
 
+        prompt_embeddings = self.prompt_embedding.unsqueeze(0).expand(batch_size, -1, -1)
+        inputs_embeds = self.gpt.get_input_embeddings()(input_ids)
+        
         if task_embedding is not None:
-            # Ensure task_embedding has the correct shape
-            task_embedding = task_embedding.view(batch_size, -1, self.gpt2.config.n_embd)
-            print(f"task_embedding shape: {task_embedding.shape}")  # Debug statement
-
-            prompt_embeddings = self.prompt_embedding.unsqueeze(0).expand(batch_size, -1, -1)
-            print(f"prompt_embeddings shape: {prompt_embeddings.shape}")  # Debug statement
-
-            combined_embeds = torch.cat((prompt_embeddings, task_embedding), dim=1)
-            print(f"combined_embeds shape: {combined_embeds.shape}")  # Debug statement
+            task_embedding = task_embedding.view(batch_size, -1, self.gpt.config.hidden_size)
+            combined_embeds = torch.cat((prompt_embeddings, task_embedding, inputs_embeds), dim=1)
         else:
-            prompt_embeddings = self.prompt_embedding.unsqueeze(0).expand(batch_size, -1, -1)
-            inputs_embeds = self.gpt2.transformer.wte(input_ids)
             combined_embeds = torch.cat((prompt_embeddings, inputs_embeds), dim=1)
-            combined_embeds = self.task_layer(combined_embeds)
+        
+        combined_embeds = self.task_layer(combined_embeds)
 
         if attention_mask is not None:
             prompt_attention = torch.ones(batch_size, self.config.num_tokens, device=attention_mask.device)
@@ -85,9 +81,7 @@ class DynamicPromptTuning(nn.Module):
             prompt_labels = torch.full((batch_size, self.config.num_tokens), -100, device=labels.device)
             labels = torch.cat((prompt_labels, labels), dim=1)
 
-        print(f"final combined_embeds shape: {combined_embeds.shape}")  # Debug statement
-
-        return self.gpt2(inputs_embeds=combined_embeds, attention_mask=attention_mask, labels=labels)
+        return self.gpt(inputs_embeds=combined_embeds, attention_mask=attention_mask, labels=labels)
 
 class DynamicMetaLearner(pl.LightningModule):
     def __init__(self, config: ModelConfig):
@@ -95,10 +89,14 @@ class DynamicMetaLearner(pl.LightningModule):
         self.save_hyperparameters()
         self.config = config
         self.model = DynamicPromptTuning(config)
-        self.memory = DynamicMemory(config.num_tasks, config.num_tokens, self.model.gpt2.config.n_embd)
+        hidden_size = self.model.gpt.config.hidden_size
+        self.memory = DynamicMemory(config.num_tasks, config.num_tokens, hidden_size)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        task_embedding = self.memory.get(batch['task_id'])
+        task_id = batch['task_id']
+        if isinstance(task_id, torch.Tensor):
+            task_id = task_id.item()
+        task_embedding = self.memory.get(task_id)
         outputs = self.model(input_ids=batch['input']['input_ids'], 
                              attention_mask=batch['input']['attention_mask'], 
                              labels=batch['input']['labels'], 
@@ -140,7 +138,7 @@ class DynamicMetaLearner(pl.LightningModule):
         )
 
         with Repository(local_dir="./hf_model", clone_from=repo_url, use_auth_token=hf_token) as repo:
-            self.model.gpt2.save_pretrained("./hf_model")
+            self.model.gpt.save_pretrained("./hf_model")
             torch.save(self.model.prompt_embedding, "./hf_model/prompt_embedding.pt")
             torch.save(self.model.task_layer.state_dict(), "./hf_model/task_layer.pt")
             
@@ -208,27 +206,25 @@ def train_model(config: ModelConfig) -> None:
     model = DynamicMetaLearner(config)
     trainer = pl.Trainer(
         max_epochs=config.num_epochs,
-        gpus=1 if torch.cuda.is_available() else 0,
-        progress_bar_refresh_rate=20,
+        accelerator='cpu',
         callbacks=[EarlyStopping(monitor='val_loss', patience=3), ModelCheckpoint(monitor='val_loss')],
         logger=TensorBoardLogger("logs", name="dynamic_few_shot_learning"),
-        log_gpu_memory=True,
-        precision=16 if torch.cuda.is_available() else 32,
+        precision=32,
     )
 
     trainer.fit(model, DataLoader(dataset, batch_size=config.batch_size, shuffle=True))
 
 if __name__ == "__main__":
     config = ModelConfig(
-        model_name="EleutherAI/gpt-neo-2.7B",
-        num_tokens=50,
-        num_tasks=10,
+        model_name="distilgpt2",
+        num_tokens=10,  # Keep this small to avoid dimension issues
+        num_tasks=5,
         learning_rate=1e-4,
-        batch_size=2,
-        num_epochs=10,
-        samples_per_task=100,
-        max_seq_length=128,
-        repo_name="dynamic_few_shot_learning"
+        batch_size=1,
+        num_epochs=5,
+        samples_per_task=50,
+        max_seq_length=64,
+        repo_name="dynamic_few_shot_learning_light"
     )
 
     train_model(config)

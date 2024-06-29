@@ -1,7 +1,6 @@
 
 # Adaptive-Language-Modeling-for-Dynamic-Few-Shot-Tasks
 
-
 This project implements a dynamic few-shot learning approach using PyTorch and Transformers, focusing on solving mathematical problems such as addition, subtraction, multiplication, and division. The model leverages GPT-2 for language modeling and prompts tailored to specific tasks, allowing adaptation to new mathematical operations with minimal training data.
 
 ## Features
