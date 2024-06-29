@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from transformers import AutoModelForCausalLM, AutoTokenizer, AdamW
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -12,10 +12,14 @@ import math
 import logging
 import os
 from dotenv import load_dotenv
-from huggingface_hub import HfApi, Repository
+from huggingface_hub import HfApi, create_repo, upload_folder
 
 # Load environment variables
 load_dotenv()
+
+# Set environment variables directly for testing purposes
+os.environ['HF_REPO_ID'] = 'san122'
+os.environ['HF_TOKEN'] = ''
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -62,21 +66,19 @@ class DynamicPromptTuning(nn.Module):
                 labels: Optional[torch.Tensor] = None, task_embedding: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         batch_size = input_ids.shape[0]
 
+        # Expand prompt embeddings to match batch size
         prompt_embeddings = self.prompt_embedding.unsqueeze(0).expand(batch_size, -1, -1)
         inputs_embeds = self.gpt.get_input_embeddings()(input_ids)
-        
-        if task_embedding is not None:
-            task_embedding = task_embedding.view(batch_size, -1, self.gpt.config.hidden_size)
-            combined_embeds = torch.cat((prompt_embeddings, task_embedding, inputs_embeds), dim=1)
-        else:
-            combined_embeds = torch.cat((prompt_embeddings, inputs_embeds), dim=1)
-        
-        combined_embeds = self.task_layer(combined_embeds)
 
+        # Concatenate prompt embeddings and input embeddings
+        combined_embeds = torch.cat((prompt_embeddings, inputs_embeds), dim=1)
+
+        # Adjust attention mask to match the combined embeddings
         if attention_mask is not None:
             prompt_attention = torch.ones(batch_size, self.config.num_tokens, device=attention_mask.device)
             attention_mask = torch.cat((prompt_attention, attention_mask), dim=1)
 
+        # Adjust labels to match the combined embeddings
         if labels is not None:
             prompt_labels = torch.full((batch_size, self.config.num_tokens), -100, device=labels.device)
             labels = torch.cat((prompt_labels, labels), dim=1)
@@ -129,20 +131,36 @@ class DynamicMetaLearner(pl.LightningModule):
             logger.warning("Hugging Face credentials not found in environment variables. Skipping push to hub.")
             return
 
+        # Correctly format the repo_id
+        repo_id = f"{hf_username}/{self.config.repo_name}"
+
         api = HfApi()
         repo_url = api.create_repo(
-            repo_id=f"{hf_username}/{self.config.repo_name}",
+            repo_id=repo_id,
             token=hf_token,
             private=False,
             exist_ok=True
         )
 
-        with Repository(local_dir="./hf_model", clone_from=repo_url, use_auth_token=hf_token) as repo:
-            self.model.gpt.save_pretrained("./hf_model")
-            torch.save(self.model.prompt_embedding, "./hf_model/prompt_embedding.pt")
-            torch.save(self.model.task_layer.state_dict(), "./hf_model/task_layer.pt")
-            
-            repo.push_to_hub(commit_message="Update model")
+        # Clone the repository if it doesn't exist locally
+        if not os.path.exists("./hf_model"):
+            os.makedirs("./hf_model")
+        
+        model_path = "./hf_model"
+        
+        # Save the model and other files
+        self.model.gpt.save_pretrained(model_path)
+        torch.save(self.model.prompt_embedding, os.path.join(model_path, "prompt_embedding.pt"))
+        torch.save(self.model.task_layer.state_dict(), os.path.join(model_path, "task_layer.pt"))
+        
+        # Upload the files to the repository
+        upload_folder(
+            repo_id=repo_id,
+            folder_path=model_path,
+            path_in_repo=".",
+            token=hf_token,
+            commit_message="Update model"
+        )
 
         logger.info(f"Model pushed to Hugging Face Hub: {repo_url}")
 
@@ -196,35 +214,63 @@ class MathProblemDataset(Dataset):
         else:
             return f"{a*b} / {b}", str(a)
 
+class GPT2Wrapper(nn.Module):
+    def __init__(self, model):
+        super(GPT2Wrapper, self).__init__()
+        self.model = model
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        return outputs.logits  # Only return the logits for tracing
+
 def train_model(config: ModelConfig) -> None:
     pl.seed_everything(42)
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     tokenizer.pad_token = tokenizer.eos_token
     dataset = MathProblemDataset(config, tokenizer)
+    
+    # Split the dataset into training and validation sets
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
     model = DynamicMetaLearner(config)
     trainer = pl.Trainer(
         max_epochs=config.num_epochs,
         accelerator='cpu',
-        callbacks=[EarlyStopping(monitor='val_loss', patience=3), ModelCheckpoint(monitor='val_loss')],
+        callbacks=[
+            EarlyStopping(monitor='val_loss', patience=3),
+            ModelCheckpoint(monitor='val_loss')
+        ],
         logger=TensorBoardLogger("logs", name="dynamic_few_shot_learning"),
         precision=32,
     )
 
-    trainer.fit(model, DataLoader(dataset, batch_size=config.batch_size, shuffle=True))
+    trainer.fit(model, DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True), DataLoader(val_dataset, batch_size=config.batch_size))
+
+    # Create a dummy input for tracing
+    dummy_input = torch.randint(0, tokenizer.vocab_size, (1, config.max_seq_length), dtype=torch.long)
+
+    # Wrap the GPT2 model
+    wrapped_model = GPT2Wrapper(model.model.gpt)
+    
+    # Export the trained model to TorchScript using tracing
+    traced_model = torch.jit.trace(wrapped_model, dummy_input)
+    traced_model.save("model.pt")
+    print("Model exported to TorchScript format and saved as model.pt")
 
 if __name__ == "__main__":
     config = ModelConfig(
         model_name="distilgpt2",
-        num_tokens=10,  # Keep this small to avoid dimension issues
+        num_tokens=10,
         num_tasks=5,
         learning_rate=1e-4,
         batch_size=1,
         num_epochs=5,
         samples_per_task=50,
         max_seq_length=64,
-        repo_name="dynamic_few_shot_learning_light"
+        repo_name="DynamicFewShotMathGPT"
     )
 
     train_model(config)
