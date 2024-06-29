@@ -1,0 +1,5 @@
+torch>=1.8.0
+transformers>=4.0.0
+pytorch-lightning>=1.2.0
+huggingface-hub>=0.0.12
+python-dotenv>=0.17.1
