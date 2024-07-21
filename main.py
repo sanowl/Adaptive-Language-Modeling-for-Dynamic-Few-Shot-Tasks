@@ -3,7 +3,7 @@ import torch.nn as nn
 import pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader, random_split
 from transformers import AutoModelForCausalLM, AutoTokenizer, AdamW
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 from typing import List, Dict, Optional
 from dataclasses import dataclass
@@ -13,6 +13,10 @@ import logging
 import os
 from dotenv import load_dotenv
 from huggingface_hub import HfApi, create_repo, upload_folder
+from torch.cuda.amp import autocast, GradScaler
+from sklearn.metrics import accuracy_score, f1_score
+import mlflow
+import yaml
 
 # Load environment variables
 load_dotenv()
@@ -28,12 +32,15 @@ class ModelConfig:
     num_tasks: int
     learning_rate: float
     batch_size: int
+    batch_size
     num_epochs: int
     samples_per_task: int
     max_seq_length: int
     repo_name: str
     hidden_size: int
     memory_size: int
+    weight_decay: float
+    warmup_steps: int
 
 class DynamicMemory(nn.Module):
     def __init__(self, num_tasks: int, num_tokens: int, embedding_dim: int):
@@ -56,6 +63,7 @@ class PrototypicalNetwork(nn.Module):
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, output_dim)
         )
 
@@ -128,7 +136,7 @@ class DynamicPromptTuning(nn.Module):
 
         return self.gpt(inputs_embeds=combined_embeds, attention_mask=attention_mask, labels=labels)
 
-class DynamicMetaLearner(pl.LightningModule):
+class ImprovedDynamicMetaLearner(pl.LightningModule):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.save_hyperparameters()
@@ -141,6 +149,8 @@ class DynamicMetaLearner(pl.LightningModule):
         self.episodic_memory = EpisodicMemory(config.memory_size, hidden_size)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
         self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.scaler = GradScaler()
+        
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         task_id = batch['task_id']
@@ -176,19 +186,30 @@ class DynamicMetaLearner(pl.LightningModule):
         return outputs.loss
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        loss = self(batch)
+        with autocast():
+            loss = self(batch)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
-    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
         loss = self(batch)
+        preds = self.generate(batch['input_ids'])
+        accuracy = accuracy_score(batch['labels'].cpu(), preds.cpu())
+        f1 = f1_score(batch['labels'].cpu(), preds.cpu(), average='weighted')
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        return loss
+        self.log('val_accuracy', accuracy, on_epoch=True, logger=True)
+        self.log('val_f1', f1, on_epoch=True, logger=True)
+        return {'val_loss': loss, 'val_accuracy': accuracy, 'val_f1': f1}
 
     def configure_optimizers(self):
-        optimizer = AdamW(self.parameters(), lr=self.config.learning_rate)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.config.num_epochs)
-        return [optimizer], [scheduler]
+        optimizer = AdamW(self.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, 
+            max_lr=self.config.learning_rate, 
+            total_steps=self.trainer.estimated_stepping_batches,
+            pct_start=self.config.warmup_steps / self.trainer.estimated_stepping_batches
+        )
+        return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
 
     def on_train_end(self):
         self.push_to_hub()
@@ -253,59 +274,6 @@ class FewShotMathDataset(Dataset):
         input_tokens['task_id'] = torch.tensor(idx // 10)  # Assign task_id based on idx for few-shot learning
         return input_tokens
 
-def train_model(config: ModelConfig) -> None:
-    pl.seed_everything(42)
-
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    # Prepare few-shot dataset
-    data = [
-        {"input": "123 + 456", "output": "579"},
-        {"input": "12 * 34", "output": "408"},
-        {"input": "100 - 75", "output": "25"},
-        {"input": "10 / 2", "output": "5"},
-        # Add more examples here
-    ]
-    
-    dataset = FewShotMathDataset(data, tokenizer, config.max_seq_length)
-    
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-
-    model = DynamicMetaLearner(config)
-    trainer = pl.Trainer(
-        max_epochs=config.num_epochs,
-        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-        callbacks=[
-            EarlyStopping(monitor='val_loss', patience=3),
-            ModelCheckpoint(monitor='val_loss')
-        ],
-        logger=TensorBoardLogger("logs", name="dynamic_few_shot_learning"),
-        precision=32,
-    )
-
-    trainer.fit(model, DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True), 
-                DataLoader(val_dataset, batch_size=config.batch_size))
-
-    save_directory = "./fine_tuned_model"
-    os.makedirs(save_directory, exist_ok=True)
-
-    tokenizer.save_pretrained(save_directory)
-    model.model.gpt.save_pretrained(save_directory)
-    torch.save(model.prototypical_network.state_dict(), os.path.join(save_directory, "prototypical_network.pt"))
-    torch.save(model.maml_layer.state_dict(), os.path.join(save_directory, "maml_layer.pt"))
-    torch.save(model.episodic_memory.state_dict(), os.path.join(save_directory, "episodic_memory.pt"))
-
-    logger.info(f"Model and tokenizer saved to {save_directory}")
-
-    # Export the model to TorchScript
-    dummy_input = torch.randint(0, tokenizer.vocab_size, (1, config.max_seq_length), dtype=torch.long)
-    traced_model = torch.jit.trace(model, dummy_input)
-    traced_model.save(os.path.join(save_directory, "model.pt"))
-    logger.info("Model exported to TorchScript format and saved as model.pt")
-
 def generate_math_problem(difficulty: str) -> Dict[str, str]:
     """Generate a random math problem based on difficulty."""
     if difficulty == "easy":
@@ -330,35 +298,40 @@ def create_dataset(num_examples: int, difficulties: List[str]) -> List[Dict[str,
     """Create a dataset with a specified number of examples and difficulties."""
     return [generate_math_problem(random.choice(difficulties)) for _ in range(num_examples)]
 
-def evaluate_model(model: DynamicMetaLearner, test_dataset: Dataset, batch_size: int) -> float:
+def evaluate_model(model: ImprovedDynamicMetaLearner, test_dataset: Dataset, batch_size: int) -> Dict[str, float]:
     """Evaluate the model on a test dataset."""
     model.eval()
     test_loader = DataLoader(test_dataset, batch_size=batch_size)
     total_loss = 0
+    all_preds = []
+    all_labels = []
 
     with torch.no_grad():
         for batch in test_loader:
             loss = model(batch)
             total_loss += loss.item()
+            preds = model.generate(batch['input_ids'])
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(batch['labels'].cpu().numpy())
 
-    return total_loss / len(test_loader)
+    accuracy = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average='weighted')
 
-if __name__ == "__main__":
-    config = ModelConfig(
-        model_name="distilgpt2",
-        num_tokens=10,
-        num_tasks=5,
-        learning_rate=1e-4,
-        batch_size=4,
-        num_epochs=10,
-        samples_per_task=50,
-        max_seq_length=64,
-        repo_name="AdvancedDynamicFewShotMathGPT",
-        hidden_size=768,  # This should match the hidden size of the base model
-        memory_size=100  # Size of the episodic memory
-    )
+    return {
+        'test_loss': total_loss / len(test_loader),
+        'test_accuracy': accuracy,
+        'test_f1': f1
+    }
 
-    # Create a larger and more diverse dataset
+def main():
+    # Load configuration
+    with open('config.yaml', 'r') as f:
+        config_dict = yaml.safe_load(f)
+    config = ModelConfig(**config_dict)
+
+    pl.seed_everything(42)
+
+    # Prepare datasets
     train_data = create_dataset(500, ["easy", "medium", "hard"])
     val_data = create_dataset(100, ["easy", "medium", "hard"])
     test_data = create_dataset(100, ["easy", "medium", "hard"])
@@ -370,53 +343,70 @@ if __name__ == "__main__":
     val_dataset = FewShotMathDataset(val_data, tokenizer, config.max_seq_length)
     test_dataset = FewShotMathDataset(test_data, tokenizer, config.max_seq_length)
 
-    model = DynamicMetaLearner(config)
+    model = ImprovedDynamicMetaLearner(config)
 
-    trainer = pl.Trainer(
-        max_epochs=config.num_epochs,
-        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-        callbacks=[
-            EarlyStopping(monitor='val_loss', patience=3),
-            ModelCheckpoint(monitor='val_loss', filename='best-checkpoint')
-        ],
-        logger=TensorBoardLogger("logs", name="dynamic_few_shot_learning"),
-        precision=32,
-    )
+    # MLflow setup
+    mlflow.set_experiment(config.repo_name)
+    with mlflow.start_run():
+        mlflow.log_params(config.__dict__)
 
-    trainer.fit(model, 
-                DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True),
-                DataLoader(val_dataset, batch_size=config.batch_size))
+        trainer = pl.Trainer(
+            max_epochs=config.num_epochs,
+            accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+            devices=torch.cuda.device_count() if torch.cuda.is_available() else None,
+            callbacks=[
+                EarlyStopping(monitor='val_loss', patience=3),
+                ModelCheckpoint(monitor='val_loss', filename='best-checkpoint'),
+                LearningRateMonitor(logging_interval='step')
+            ],
+            logger=TensorBoardLogger("logs", name="dynamic_few_shot_learning"),
+            precision=16,  # Enable mixed-precision training
+            strategy='ddp' if torch.cuda.device_count() > 1 else None,  # Enable distributed training if multiple GPUs are available
+        )
 
-    # Evaluate the model on the test set
-    test_loss = evaluate_model(model, test_dataset, config.batch_size)
-    logger.info(f"Test Loss: {test_loss:.4f}")
+        trainer.fit(
+            model, 
+            DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4),
+            DataLoader(val_dataset, batch_size=config.batch_size, num_workers=4)
+        )
 
-    # Save the model
-    save_directory = "./fine_tuned_model"
-    os.makedirs(save_directory, exist_ok=True)
+        # Log metrics to MLflow
+        mlflow.log_metrics(trainer.callback_metrics)
 
-    tokenizer.save_pretrained(save_directory)
-    model.model.gpt.save_pretrained(save_directory)
-    torch.save(model.model.task_layer.state_dict(), os.path.join(save_directory, "task_layer.pt"))
-    torch.save(model.prototypical_network.state_dict(), os.path.join(save_directory, "prototypical_network.pt"))
-    torch.save(model.maml_layer.state_dict(), os.path.join(save_directory, "maml_layer.pt"))
-    torch.save(model.episodic_memory.state_dict(), os.path.join(save_directory, "episodic_memory.pt"))
+        # Evaluate the model on the test set
+        test_results = evaluate_model(model, test_dataset, config.batch_size)
+        mlflow.log_metrics(test_results)
 
-    logger.info(f"Model and tokenizer saved to {save_directory}")
+        logger.info(f"Test Results: {test_results}")
 
-    # Export the model to TorchScript
-    dummy_input = {
-        'input_ids': torch.randint(0, tokenizer.vocab_size, (1, config.max_seq_length), dtype=torch.long),
-        'attention_mask': torch.ones((1, config.max_seq_length), dtype=torch.long),
-        'labels': torch.randint(0, tokenizer.vocab_size, (1, config.max_seq_length), dtype=torch.long),
-        'task_id': torch.tensor([0])
-    }
-    traced_model = torch.jit.trace(model, [dummy_input])
-    traced_model.save(os.path.join(save_directory, "model.pt"))
-    logger.info("Model exported to TorchScript format and saved as model.pt")
+        # Save the model
+        save_directory = "./fine_tuned_model"
+        os.makedirs(save_directory, exist_ok=True)
 
-    # Push the model to Hugging Face Hub
-    model.push_to_hub()
+        tokenizer.save_pretrained(save_directory)
+        model.model.gpt.save_pretrained(save_directory)
+        torch.save(model.model.task_layer.state_dict(), os.path.join(save_directory, "task_layer.pt"))
+        torch.save(model.prototypical_network.state_dict(), os.path.join(save_directory, "prototypical_network.pt"))
+        torch.save(model.maml_layer.state_dict(), os.path.join(save_directory, "maml_layer.pt"))
+        torch.save(model.episodic_memory.state_dict(), os.path.join(save_directory, "episodic_memory.pt"))
 
-    logger.info("Training and evaluation completed successfully!")
+        logger.info(f"Model and tokenizer saved to {save_directory}")
 
+        # Export the model to TorchScript
+        dummy_input = {
+            'input_ids': torch.randint(0, tokenizer.vocab_size, (1, config.max_seq_length), dtype=torch.long),
+            'attention_mask': torch.ones((1, config.max_seq_length), dtype=torch.long),
+            'labels': torch.randint(0, tokenizer.vocab_size, (1, config.max_seq_length), dtype=torch.long),
+            'task_id': torch.tensor([0])
+        }
+        traced_model = torch.jit.trace(model, [dummy_input])
+        traced_model.save(os.path.join(save_directory, "model.pt"))
+        logger.info("Model exported to TorchScript format and saved as model.pt")
+
+        # Push the model to Hugging Face Hub
+        model.push_to_hub()
+
+    logger.info("Training, evaluation, and model saving completed successfully!")
+
+if __name__ == "__main__":
+    main()
