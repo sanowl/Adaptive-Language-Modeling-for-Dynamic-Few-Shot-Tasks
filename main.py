@@ -7,7 +7,6 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, Learning
 from pytorch_lightning.loggers import TensorBoardLogger
 from typing import List, Dict, Optional
 from dataclasses import dataclass
-import random
 import math
 import logging
 import os
@@ -17,6 +16,7 @@ from torch.cuda.amp import autocast, GradScaler
 from sklearn.metrics import accuracy_score, f1_score
 import mlflow
 import yaml
+import secrets
 
 # Load environment variables
 load_dotenv()
@@ -277,18 +277,18 @@ class FewShotMathDataset(Dataset):
 def generate_math_problem(difficulty: str) -> Dict[str, str]:
     """Generate a random math problem based on difficulty."""
     if difficulty == "easy":
-        a, b = random.randint(1, 100), random.randint(1, 100)
-        op = random.choice(['+', '-'])
+        a, b = secrets.SystemRandom().randint(1, 100), secrets.SystemRandom().randint(1, 100)
+        op = secrets.choice(['+', '-'])
         problem = f"{a} {op} {b}"
         solution = str(eval(problem))
     elif difficulty == "medium":
-        a, b = random.randint(1, 20), random.randint(1, 20)
-        op = random.choice(['*', '//'])
+        a, b = secrets.SystemRandom().randint(1, 20), secrets.SystemRandom().randint(1, 20)
+        op = secrets.choice(['*', '//'])
         problem = f"{a} {op} {b}"
         solution = str(eval(problem))
     else:  # hard
-        a, b, c = random.randint(1, 20), random.randint(1, 20), random.randint(1, 20)
-        op1, op2 = random.choices(['+', '-', '*', '//'], k=2)
+        a, b, c = secrets.SystemRandom().randint(1, 20), secrets.SystemRandom().randint(1, 20), secrets.SystemRandom().randint(1, 20)
+        op1, op2 = secrets.SystemRandom().choices(['+', '-', '*', '//'], k=2)
         problem = f"{a} {op1} {b} {op2} {c}"
         solution = str(eval(problem))
     
@@ -296,7 +296,7 @@ def generate_math_problem(difficulty: str) -> Dict[str, str]:
 
 def create_dataset(num_examples: int, difficulties: List[str]) -> List[Dict[str, str]]:
     """Create a dataset with a specified number of examples and difficulties."""
-    return [generate_math_problem(random.choice(difficulties)) for _ in range(num_examples)]
+    return [generate_math_problem(secrets.choice(difficulties)) for _ in range(num_examples)]
 
 def evaluate_model(model: ImprovedDynamicMetaLearner, test_dataset: Dataset, batch_size: int) -> Dict[str, float]:
     """Evaluate the model on a test dataset."""
